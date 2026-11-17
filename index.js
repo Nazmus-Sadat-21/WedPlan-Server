@@ -19,14 +19,73 @@ export async function connectToMongoDB() {
 }
 
 const mongoClient = await connectToMongoDB();
-const db = mongoClient ? mongoClient.db("WedPlan") : null;
+const database = mongoClient ? mongoClient.db("WedPlan") : null;
+
+const users = database.collection("user");
+const sessions = database.collection("session");
+const services = database.collection("services");
+const bookings = database.collection("bookings");
+const transactions = database.collection("transactions");
 
 
 
-app.use(cors({
-  origin: true, 
-  credentials: true,
-}));
+// process.env.NEXT_PUBLIC_SERVER_API/users
+// process.env.NEXT_PUBLIC_SERVER_API/users
+// process.env.NEXT_PUBLIC_SERVER_API/users
+// process.env.NEXT_PUBLIC_SERVER_API/users
+// process.env.NEXT_PUBLIC_SERVER_API/users
+// process.env.NEXT_PUBLIC_SERVER_API/users
+// process.env.NEXT_PUBLIC_SERVER_API/users
+// process.env.NEXT_PUBLIC_SERVER_API/users
+// process.env.NEXT_PUBLIC_SERVER_API/users
+// process.env.NEXT_PUBLIC_SERVER_API/users
+// process.env.NEXT_PUBLIC_SERVER_API/users
+// process.env.NEXT_PUBLIC_SERVER_API/users
+
+
+app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
+    const cursor = users.find({});
+    const result = await cursor.toArray();
+    res.send(result);
+})
+
+
+app.get('/users/:id', async (req, res) => {
+    const id = req.params.id;
+    const query = { _id: new ObjectId(id) };
+    const result = await users.findOne(query);
+    res.send(result);
+});
+
+
+app.post("services", async (req, res) => {
+  const service = req.body;
+  const result = await services.insertOne(service);
+  res.send(result);
+});
+
+
+app.get("/services", async (req, res) => {
+  const cursor = services.find({});
+  const result = await cursor.toArray();
+  res.send(result);
+});
+
+
+app.get("/services/:id", async (req, res) => {
+  const id = req.params.id;
+  const query = { _id: new ObjectId(id) };
+  const result = await services.findOne(query);
+  res.send(result);
+});
+
+
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  }),
+);
 app.use(express.json());
 
 
@@ -46,7 +105,7 @@ app.use(express.json());
 
 
 app.get("/", (req, res) => {
-  res.send("Hello World!");
+  res.send("Welcome to the WedPlan API!");
 });
 
 app.listen(port, () => {
