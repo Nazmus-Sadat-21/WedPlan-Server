@@ -175,6 +175,23 @@ app.patch("/services/:id", async (req, res) => {
 });
 
 
+app.delete("/services/:id", async (req, res) => {
+  const id = req.params.id;
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: "Invalid service id." });
+  }
+
+  const service = await services.findOne({ _id: new ObjectId(id) });
+  if (!service) {
+    return res.status(404).send({ message: "Service not found." });
+  }
+  if (service.vendorId !== req.query.vendorId) {
+    return res.status(403).send({ message: "You can only delete your own services." });
+  }
+
+  await services.deleteOne({ _id: service._id });
+  res.send({ deletedId: id });
+});
 
 
 
