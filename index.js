@@ -345,7 +345,28 @@ app.get("/bookings/customer/:customerId", async (req, res) => {
   res.send(await addDetailsToBookings(result));
 });
 
+app.patch("/bookings/:id/cancel", async (req, res) => {
+  const id = req.params.id;
+  const { customerId } = req.body;
 
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: "Invalid booking id." });
+  }
+
+  const booking = await bookings.findOne({ _id: new ObjectId(id) });
+  if (!booking) {
+    return res.status(404).send({ message: "Booking not found." });
+  }
+  if (booking.customerId !== customerId) {
+    return res.status(403).send({ message: "This booking does not belong to you." });
+  }
+  if (booking.status !== "pending") {
+    return res.status(400).send({ message: `A ${booking.status} booking cannot be cancelled.` });
+  }
+
+  await bookings.updateOne({ _id: booking._id }, { $set: { status: "cancelled" } });
+  res.send({ message: "Booking cancelled.", status: "cancelled" });
+});
 
 
 
