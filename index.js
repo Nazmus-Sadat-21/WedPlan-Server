@@ -2,11 +2,13 @@ import express from "express";
 import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
 import cors from "cors";
+import Stripe from "stripe";
 
 const app = express();
 const port = process.env.PORT || 8000;
 
 const client = new MongoClient(process.env.MONGO_URI);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 export async function connectToMongoDB() {
   try {
@@ -113,6 +115,38 @@ app.use(express.json());
 // process.env.NEXT_PUBLIC_SERVER_API/users
 // process.env.NEXT_PUBLIC_SERVER_API/users
 
+async function addDetailsToBookings(list) {
+  const serviceMap = await getMap(services, list.map((b) => b.serviceId));
+  const vendorMap = await getMap(users, list.map((b) => b.vendorId));
+  const customerMap = await getMap(users, list.map((b) => b.customerId));
+
+  return list.map((b) => {
+    const service = serviceMap[b.serviceId];
+    const customer = customerMap[b.customerId];
+    return {
+      ...b,
+      service: service
+        ? {
+            _id: service._id,
+            serviceName: service.serviceName,
+            category: service.category,
+            price: service.price,
+            location: service.location,
+            image: service.images?.[0],
+          }
+        : null,
+      vendor: publicVendor(vendorMap[b.vendorId]),
+      customer: customer
+        ? {
+            _id: customer._id,
+            name: customer.name,
+            email: customer.email,
+            image: customer.image,
+          }
+        : null,
+    };
+  });
+}
 
 app.get('/users', async (req, res) => {
     const cursor = users.find({});
@@ -427,7 +461,46 @@ app.get("/bookings/vendor/:vendorId", async (req, res) => {
   res.send(await addDetailsToBookings(result));
 });
 
+app.get("/bookings/:id", async (req, res) => {
+  const id = req.params.id;
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: "Invalid booking id." });
+  }
 
+  const booking = await bookings.findOne({ _id: new ObjectId(id) });
+  if (!booking) {
+    return res.status(404).send({ message: "Booking not found." });
+  }
+
+  const [result] = await addDetailsToBookings([booking]);
+  res.send(result);
+});
+
+app.patch("/bookings/:id/status", async (req, res) => {
+  const id = req.params.id;
+  const { status, vendorId } = req.body;
+
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: "Invalid booking id." });
+  }
+  if (!["accepted", "rejected"].includes(status)) {
+    return res.status(400).send({ message: "Status must be accepted or rejected." });
+  }
+
+  const booking = await bookings.findOne({ _id: new ObjectId(id) });
+  if (!booking) {
+    return res.status(404).send({ message: "Booking not found." });
+  }
+  if (booking.vendorId !== vendorId) {
+    return res.status(403).send({ message: "This booking does not belong to you." });
+  }
+  if (booking.status !== "pending") {
+    return res.status(400).send({ message: `Booking is already ${booking.status}.` });
+  }
+
+  await bookings.updateOne({ _id: booking._id }, { $set: { status } });
+  res.send({ message: `Booking ${status}.`, status });
+});
 
 
 
