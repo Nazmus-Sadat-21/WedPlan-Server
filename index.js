@@ -337,7 +337,13 @@ app.post("/bookings", async (req, res) => {
   res.status(201).send(result);
 });
 
-
+app.get("/bookings/customer/:customerId", async (req, res) => {
+  const result = await bookings
+    .find({ customerId: req.params.customerId })
+    .sort({ createdAt: -1 })
+    .toArray();
+  res.send(await addDetailsToBookings(result));
+});
 
 
 
