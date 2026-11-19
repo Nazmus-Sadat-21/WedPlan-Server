@@ -42,6 +42,54 @@ function isPremium(user) {
   return user?.subscriptionPlan === "premium";
 }
 
+/** Convert a list of ids into unique ObjectIds, ignoring anything invalid. */
+function uniqueObjectIds(values) {
+  const ids = new Set(
+    values
+      .filter((value) => value && ObjectId.isValid(value))
+      .map((value) => String(value)),
+  );
+  return [...ids].map((value) => new ObjectId(value));
+}
+
+/**
+ * Enrich booking documents with the service and vendor details the customer
+ * dashboard needs, so the client can render a booking in one request.
+ */
+async function addDetailsToBookings(bookingList) {
+  if (!Array.isArray(bookingList) || bookingList.length === 0) return [];
+
+  const serviceIds = uniqueObjectIds(bookingList.map((booking) => booking.serviceId));
+  const vendorIds = uniqueObjectIds(bookingList.map((booking) => booking.vendorId));
+
+  const [serviceDocs, vendorDocs] = await Promise.all([
+    serviceIds.length ? services.find({ _id: { $in: serviceIds } }).toArray() : [],
+    vendorIds.length ? users.find({ _id: { $in: vendorIds } }).toArray() : [],
+  ]);
+
+  const serviceMap = new Map(serviceDocs.map((service) => [String(service._id), service]));
+  const vendorMap = new Map(vendorDocs.map((vendor) => [String(vendor._id), vendor]));
+
+  return bookingList.map((booking) => {
+    const service = serviceMap.get(String(booking.serviceId)) ?? null;
+    const vendor = vendorMap.get(String(booking.vendorId)) ?? null;
+
+    return {
+      ...booking,
+      service,
+      vendor: vendor
+        ? {
+            _id: vendor._id,
+            name: vendor.name ?? null,
+            email: vendor.email ?? null,
+            image: vendor.image ?? null,
+            businessName: vendor.businessName ?? null,
+          }
+        : null,
+    };
+  });
+}
+
 
 app.use(
   cors({
@@ -302,7 +350,10 @@ app.post("/bookings", async (req, res) => {
   }
 
   const service = await services.findOne({ _id: new ObjectId(serviceId) });
-  if (!service || service.status !== "approved" || service.availability !== "active") {
+  // Legacy services may still store a boolean availability flag.
+  const bookableAvailability =
+    service?.availability === "active" || service?.availability === true;
+  if (!service || service.status !== "approved" || !bookableAvailability) {
     return res.status(404).send({ message: "Service is not available for booking." });
   }
   if (service.vendorId === customerId) {
@@ -368,7 +419,13 @@ app.patch("/bookings/:id/cancel", async (req, res) => {
   res.send({ message: "Booking cancelled.", status: "cancelled" });
 });
 
-
+app.get("/bookings/vendor/:vendorId", async (req, res) => {
+  const result = await bookings
+    .find({ vendorId: req.params.vendorId })
+    .sort({ createdAt: -1 })
+    .toArray();
+  res.send(await addDetailsToBookings(result));
+});
 
 
 
