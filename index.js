@@ -27,11 +27,34 @@ const services = database.collection("services");
 const bookings = database.collection("bookings");
 const transactions = database.collection("transactions");
 
+const FREE_PLAN_LIMIT = 3;
+
+const categories = [
+  "Photography & Videography",
+  "Wedding Venues",
+  "Decoration & Florist",
+  "Catering Services",
+  "Makeup & Styling",
+  "Wedding Fashion",
+];
+
+function isPremium(user) {
+  return user?.subscriptionPlan === "premium";
+}
 
 
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  }),
+);
+app.use(express.json());
+
 // process.env.NEXT_PUBLIC_SERVER_API/users
-// process.env.NEXT_PUBLIC_SERVER_API/users
-// process.env.NEXT_PUBLIC_SERVER_API/users
+// process.env.NEXT_PUBLIC_SERVER_API/users:id
+// process.env.NEXT_PUBLIC_SERVER_API/services
+// process.env.NEXT_PUBLIC_SERVER_API/services:id
 // process.env.NEXT_PUBLIC_SERVER_API/users
 // process.env.NEXT_PUBLIC_SERVER_API/users
 // process.env.NEXT_PUBLIC_SERVER_API/users
@@ -43,7 +66,7 @@ const transactions = database.collection("transactions");
 // process.env.NEXT_PUBLIC_SERVER_API/users
 
 
-app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
+app.get('/users', async (req, res) => {
     const cursor = users.find({});
     const result = await cursor.toArray();
     res.send(result);
@@ -58,7 +81,7 @@ app.get('/users/:id', async (req, res) => {
 });
 
 
-app.post("services", async (req, res) => {
+app.post("/services", async (req, res) => {
   const service = req.body;
   const result = await services.insertOne(service);
   res.send(result);
@@ -80,13 +103,80 @@ app.get("/services/:id", async (req, res) => {
 });
 
 
-app.use(
-  cors({
-    origin: true,
-    credentials: true,
-  }),
-);
-app.use(express.json());
+app.patch("/services/:id", async (req, res) => {
+  const id = req.params.id;
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: "Invalid service id." });
+  }
+
+  const service = await services.findOne({ _id: new ObjectId(id) });
+  if (!service) {
+    return res.status(404).send({ message: "Service not found." });
+  }
+
+  // ownership check (vendorId will come from the token later)
+  if (service.vendorId !== req.body.vendorId) {
+    return res.status(403).send({ message: "You can only update your own services." });
+  }
+
+  const allowedFields = [
+    "serviceName",
+    "category",
+    "description",
+    "price",
+    "location",
+    "images",
+    "availability",
+  ];
+  const updates = {};
+  for (const field of allowedFields) {
+    if (field in req.body) updates[field] = req.body[field];
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).send({ message: "No valid fields to update." });
+  }
+  if ("category" in updates && !categories.includes(updates.category)) {
+    return res.status(400).send({ message: "Invalid category." });
+  }
+  if ("price" in updates) {
+    if (isNaN(updates.price) || Number(updates.price) <= 0) {
+      return res.status(400).send({ message: "Price must be a positive number." });
+    }
+    updates.price = Number(updates.price);
+  }
+  if ("availability" in updates && !["active", "inactive"].includes(updates.availability)) {
+    return res.status(400).send({ message: "Invalid availability." });
+  }
+
+  // turning a service back to active must respect the free plan limit
+  if (updates.availability === "active" && service.availability !== "active") {
+    const vendor = await users.findOne({ _id: new ObjectId(service.vendorId) });
+    if (!isPremium(vendor)) {
+      const activeCount = await services.countDocuments({
+        vendorId: service.vendorId,
+        availability: { $in: ["active", true] },
+        status: { $ne: "rejected" },
+      });
+      if (activeCount >= FREE_PLAN_LIMIT) {
+        return res.status(403).send({
+          message: "Free plan allows only 3 active services. Upgrade to Premium.",
+        });
+      }
+    }
+  }
+
+  const result = await services.findOneAndUpdate(
+    { _id: new ObjectId(id) },
+    { $set: updates },
+    { returnDocument: "after" },
+  );
+  res.send(result);
+});
+
+
+
+
 
 
 
