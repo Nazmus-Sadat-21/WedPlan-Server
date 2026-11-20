@@ -8,7 +8,11 @@ const app = express();
 const port = process.env.PORT || 8000;
 
 const client = new MongoClient(process.env.MONGO_URI);
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  // Fail fast: a slow Stripe API must not leave the success page waiting.
+  timeout: 10000,
+  maxNetworkRetries: 1,
+});
 
 export async function connectToMongoDB() {
   try {
@@ -52,6 +56,27 @@ function uniqueObjectIds(values) {
       .map((value) => String(value)),
   );
   return [...ids].map((value) => new ObjectId(value));
+}
+
+/** Minimal vendor fields that are safe to expose on the admin ledger. */
+function publicVendor(vendor) {
+  if (!vendor) return null;
+  return {
+    _id: vendor._id,
+    name: vendor.name ?? null,
+    email: vendor.email ?? null,
+    image: vendor.image ?? null,
+    businessName: vendor.businessName ?? null,
+  };
+}
+
+/** Map documents by string id so enriched records can join without N+1 queries. */
+async function getMap(collection, ids) {
+  const uniqueIds = uniqueObjectIds(ids);
+  if (uniqueIds.length === 0) return {};
+
+  const docs = await collection.find({ _id: { $in: uniqueIds } }).toArray();
+  return Object.fromEntries(docs.map((doc) => [String(doc._id), doc]));
 }
 
 /**
@@ -120,27 +145,96 @@ async function addDetailsToBookings(bookingList) {
   });
 }
 
+/**
+ * Persist a paid Stripe checkout session and activate Premium for its vendor.
+ * Used by the signed webhook and by the success-page reconciliation fallback.
+ * Callers must pass a session whose payment_status is already verified as paid.
+ */
+async function recordPaidCheckoutSession(session) {
+  if (!session || session.payment_status !== "paid") return null;
+
+  const existing = await transactions.findOne({ stripeSessionId: session.id });
+  if (existing) return existing;
+
+  const vendorId = session.metadata?.vendorId;
+  if (!vendorId || !ObjectId.isValid(vendorId)) {
+    console.error(
+      `Paid checkout session ${session.id} is missing a valid vendorId.`,
+    );
+    return null;
+  }
+
+  const transaction = {
+    vendorId,
+    plan: "premium",
+    amount: (session.amount_total ?? 0) / 100,
+    currency: session.currency ?? "usd",
+    stripeSessionId: session.id,
+    stripeSubscriptionId: session.subscription ?? null,
+    status: "paid",
+    createdAt: new Date(),
+  };
+
+  await transactions.insertOne(transaction);
+
+  const expiresAt = new Date();
+  expiresAt.setFullYear(expiresAt.getFullYear() + 1);
+
+  await users.updateOne(
+    { _id: new ObjectId(vendorId) },
+    { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: expiresAt } },
+  );
+
+  return transaction;
+}
+
 app.use(
   cors({
     origin: true,
     credentials: true,
   }),
 );
+
+
+app.post(
+  "/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        req.headers["stripe-signature"],
+        process.env.STRIPE_SECRET_KEY,
+      );
+    } catch (err) {
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // payment completed -> save transaction + activate premium
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+
+      if (session.payment_status === "paid") {
+        await recordPaidCheckoutSession(session);
+      }
+    }
+
+    
+    
+
+    res.send({ received: true });
+  },
+);
+
+
+
+
+
+
 app.use(express.json());
 
-// process.env.NEXT_PUBLIC_SERVER_API/users
-// process.env.NEXT_PUBLIC_SERVER_API/users:id
-// process.env.NEXT_PUBLIC_SERVER_API/services
-// process.env.NEXT_PUBLIC_SERVER_API/services:id
-// process.env.NEXT_PUBLIC_SERVER_API/users
-// process.env.NEXT_PUBLIC_SERVER_API/users
-// process.env.NEXT_PUBLIC_SERVER_API/users
-// process.env.NEXT_PUBLIC_SERVER_API/users
-// process.env.NEXT_PUBLIC_SERVER_API/users
-// process.env.NEXT_PUBLIC_SERVER_API/users
-// process.env.NEXT_PUBLIC_SERVER_API/users
-// process.env.NEXT_PUBLIC_SERVER_API/users
-// process.env.NEXT_PUBLIC_SERVER_API/users
+
 
 app.get("/users", async (req, res) => {
   const cursor = users.find({});
@@ -154,6 +248,30 @@ app.get("/users/:id", async (req, res) => {
   const result = await users.findOne(query);
   res.send(result);
 });
+
+app.patch("/users/profile/:id", async (req, res) => {
+  const id = req.params.id;
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: "Invalid user id." });
+  }
+
+  const updates = {};
+  if ("name" in req.body) updates.name = req.body.name;
+  if ("image" in req.body) updates.image = req.body.image;
+
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).send({ message: "No valid fields to update." });
+  }
+
+  const result = await users.findOneAndUpdate(
+    { _id: new ObjectId(id) },
+    { $set: updates },
+    { returnDocument: "after" },
+  );
+  res.send(result);
+});
+
+
 
 app.post("/services", async (req, res) => {
   const service = req.body;
@@ -541,34 +659,45 @@ app.post("/create-checkout-session", async (req, res) => {
       .send({ message: "You are already a Premium vendor." });
   }
 
-  const session = await stripe.checkout.sessions.create({
-    mode: "subscription",
-    customer_email: vendor.email,
-    line_items: [
-      {
-        price_data: {
-          currency: "usd",
-          product_data: { name: "WedPlan Premium Vendor" },
-          unit_amount: 2000, // $20.00
-          recurring: { interval: "month" },
-        },
-        quantity: 1,
+ const session = await stripe.checkout.sessions.create({
+  mode: "payment",
+  customer_email: vendor.email,
+  line_items: [
+    {
+      price_data: {
+        currency: "usd",
+        product_data: { name: "WedPlan Premium Vendor" },
+        unit_amount: 2900, // $29.00 one time
       },
-    ],
-    metadata: { vendorId },
-    subscription_data: { metadata: { vendorId } },
-    success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
-  });
+      quantity: 1,
+    },
+  ],
+  metadata: { vendorId },
+  success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+  cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
+});
 
   res.send({ url: session.url });
 });
 
-// payment success page: show the saved transaction (saved by webhook only)
+// payment success page: return the saved transaction. The webhook is the
+// primary writer; this route reconciles directly with Stripe if it is missing.
 app.get("/transactions/session/:sessionId", async (req, res) => {
-  const result = await transactions.findOne({
-    stripeSessionId: req.params.sessionId,
-  });
+  const { sessionId } = req.params;
+  let result = await transactions.findOne({ stripeSessionId: sessionId });
+
+  if (!result) {
+    // Reconciliation fallback: if the webhook is delayed or is not configured
+    // locally, verify the checkout session directly with Stripe. This never
+    // trusts the browser redirect — only Stripe's own paid status can create
+    // the transaction and activate Premium.
+    try {
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      result = await recordPaidCheckoutSession(session);
+    } catch (err) {
+      console.error("Stripe session verification failed:", err.message);
+    }
+  }
 
   if (!result) {
     return res
@@ -624,6 +753,11 @@ app.get("/", (req, res) => {
 });
 
 app.listen(port, () => {
+  if (!process.env.STRIPE_SECRET_KEY) {
+    console.warn(
+      "STRIPE_SECRET_KEY is not set. The application will not be able to interact with the Stripe API.",
+    );
+  }
   console.log(`Server is running at http://localhost:${port}/`);
 });
 
