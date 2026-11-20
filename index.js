@@ -228,10 +228,6 @@ app.post(
 );
 
 
-
-
-
-
 app.use(express.json());
 
 
@@ -272,7 +268,6 @@ app.patch("/users/profile/:id", async (req, res) => {
 });
 
 
-
 app.post("/services", async (req, res) => {
   const service = req.body;
   const result = await services.insertOne(service);
@@ -280,7 +275,7 @@ app.post("/services", async (req, res) => {
 });
 
 app.get("/services", async (req, res) => {
-  const cursor = services.find({});
+  const cursor = services.find({createdAt: { $exists: true }}).sort({ createdAt: -1 });
   const result = await cursor.toArray();
   res.send(result);
 });
@@ -762,3 +757,6 @@ app.listen(port, () => {
 });
 
 export default app;
+
+
+
