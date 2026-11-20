@@ -55,26 +55,32 @@ function uniqueObjectIds(values) {
 }
 
 /**
- * Enrich booking documents with the service and vendor details the customer
- * dashboard needs, so the client can render a booking in one request.
+ * Enrich booking documents with the service, vendor and customer details the
+ * dashboards need, so the client can render a booking in one request.
  */
 async function addDetailsToBookings(bookingList) {
   if (!Array.isArray(bookingList) || bookingList.length === 0) return [];
 
   const serviceIds = uniqueObjectIds(bookingList.map((booking) => booking.serviceId));
   const vendorIds = uniqueObjectIds(bookingList.map((booking) => booking.vendorId));
+  const customerIds = uniqueObjectIds(bookingList.map((booking) => booking.customerId));
 
-  const [serviceDocs, vendorDocs] = await Promise.all([
+  const [serviceDocs, vendorDocs, customerDocs] = await Promise.all([
     serviceIds.length ? services.find({ _id: { $in: serviceIds } }).toArray() : [],
     vendorIds.length ? users.find({ _id: { $in: vendorIds } }).toArray() : [],
+    customerIds.length ? users.find({ _id: { $in: customerIds } }).toArray() : [],
   ]);
 
   const serviceMap = new Map(serviceDocs.map((service) => [String(service._id), service]));
   const vendorMap = new Map(vendorDocs.map((vendor) => [String(vendor._id), vendor]));
+  const customerMap = new Map(
+    customerDocs.map((customer) => [String(customer._id), customer]),
+  );
 
   return bookingList.map((booking) => {
     const service = serviceMap.get(String(booking.serviceId)) ?? null;
     const vendor = vendorMap.get(String(booking.vendorId)) ?? null;
+    const customer = customerMap.get(String(booking.customerId)) ?? null;
 
     return {
       ...booking,
@@ -86,6 +92,14 @@ async function addDetailsToBookings(bookingList) {
             email: vendor.email ?? null,
             image: vendor.image ?? null,
             businessName: vendor.businessName ?? null,
+          }
+        : null,
+      customer: customer
+        ? {
+            _id: customer._id,
+            name: customer.name ?? null,
+            email: customer.email ?? null,
+            image: customer.image ?? null,
           }
         : null,
     };
@@ -115,38 +129,7 @@ app.use(express.json());
 // process.env.NEXT_PUBLIC_SERVER_API/users
 // process.env.NEXT_PUBLIC_SERVER_API/users
 
-async function addDetailsToBookings(list) {
-  const serviceMap = await getMap(services, list.map((b) => b.serviceId));
-  const vendorMap = await getMap(users, list.map((b) => b.vendorId));
-  const customerMap = await getMap(users, list.map((b) => b.customerId));
 
-  return list.map((b) => {
-    const service = serviceMap[b.serviceId];
-    const customer = customerMap[b.customerId];
-    return {
-      ...b,
-      service: service
-        ? {
-            _id: service._id,
-            serviceName: service.serviceName,
-            category: service.category,
-            price: service.price,
-            location: service.location,
-            image: service.images?.[0],
-          }
-        : null,
-      vendor: publicVendor(vendorMap[b.vendorId]),
-      customer: customer
-        ? {
-            _id: customer._id,
-            name: customer.name,
-            email: customer.email,
-            image: customer.image,
-          }
-        : null,
-    };
-  });
-}
 
 app.get('/users', async (req, res) => {
     const cursor = users.find({});
