@@ -518,7 +518,7 @@ app.post("/services", requireRole("vendor"), async (req, res) => {
 
 // Public for approved listings; the owner and admins can also read their own
 // pending/rejected listings.
-app.get("/services/:id", createAuth(), async (req, res) => {
+app.get("/services/:id", requireAuth, async (req, res) => {
   const { id } = req.params;
   if (!ObjectId.isValid(id)) {
     return res.status(400).send({ message: "Invalid service id." });
