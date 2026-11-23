@@ -406,7 +406,7 @@ app.use(attachUser);
 
 // Admin: list every platform user.
 app.get("/users", requireRole("admin"), async (req, res) => {
-  const result = await users.find({}).toArray();
+  const result = await users.find({}).sort({createdAt:-1}).toArray();
   res.send(result);
 });
 
