@@ -9,31 +9,91 @@ import { createAuth } from "./auth.js";
 const app = express();
 const port = process.env.PORT || 8000;
 
-const client = new MongoClient(process.env.MONGO_URI);
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-  // Fail fast: a slow Stripe API must not leave the success page waiting.
-  timeout: 10000,
-  maxNetworkRetries: 1,
-});
+/* --------------------------------------------------------------------------
+   Async error safety (Express 4)
+   Express 4 does not forward rejected promises from async handlers to the
+   error middleware, so a DB error would leave the request hanging. This wraps
+   every route handler so rejections reach the error handler. It is harmless on
+   Express 5, which does this natively.
+--------------------------------------------------------------------------- */
+const wrapHandler = (fn) =>
+  typeof fn === "function" && fn.length < 4
+    ? (req, res, next) => {
+        try {
+          const result = fn(req, res, next);
+          if (result && typeof result.catch === "function") result.catch(next);
+        } catch (err) {
+          next(err);
+        }
+      }
+    : fn;
 
-export async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log("You successfully connected to MongoDB!");
-    return client;
-  } catch (err) {
-    console.error("MongoDB connection error:", err);
-  }
+for (const method of ["get", "post", "patch", "delete"]) {
+  const original = app[method].bind(app);
+  app[method] = (path, ...handlers) => {
+    // app.get("setting") with one argument is Express's settings getter.
+    if (handlers.length === 0) return original(path);
+    return original(path, ...handlers.map(wrapHandler));
+  };
 }
 
-const mongoClient = await connectToMongoDB();
-const database = mongoClient ? mongoClient.db("WedPlan") : null;
+/* --------------------------------------------------------------------------
+   MongoDB + Stripe setup
+--------------------------------------------------------------------------- */
+if (!process.env.MONGO_URI) {
+  throw new Error(
+    "MONGO_URI is not set. Add it to your environment variables.",
+  );
+}
 
+const client = new MongoClient(process.env.MONGO_URI, {
+  // Fail predictably instead of hanging a request for the default 30 seconds.
+  serverSelectionTimeoutMS: 10_000,
+  connectTimeoutMS: 10_000,
+});
+
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY, {
+      // Fail fast: a slow Stripe API must not leave the success page waiting.
+      timeout: 10000,
+      maxNetworkRetries: 1,
+    })
+  : null;
+
+// Collection handles don't need an open connection to be created, so they are
+// always valid objects (never null) and the driver connects on demand.
+const database = client.db("WedPlan");
 const users = database.collection("user");
 const sessions = database.collection("session");
 const services = database.collection("services");
 const bookings = database.collection("bookings");
 const transactions = database.collection("transactions");
+
+/**
+ * Connect once and share the promise. If the attempt fails, the cached promise
+ * is cleared so the next request retries instead of staying broken forever.
+ */
+let connecting = null;
+export function connectToMongoDB() {
+  if (!connecting) {
+    connecting = client
+      .connect()
+      .then(() => {
+        console.log("You successfully connected to MongoDB!");
+        return client;
+      })
+      .catch((err) => {
+        connecting = null; // allow a retry on the next request
+        throw err;
+      });
+  }
+  return connecting;
+}
+
+// Warm up at startup, but never block or crash if it fails.
+connectToMongoDB().catch((err) =>
+  console.error("Initial MongoDB connection failed:", err?.message ?? err),
+);
 
 const { attachUser, requireAuth, requireRole, isSelfOrAdmin } =
   createAuth(users);
@@ -213,17 +273,57 @@ async function downgradeVendor(vendorId) {
   );
 }
 
-const allowedOrigins = (process.env.CLIENT_URL || "http://localhost:3000")
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
+/** Public client origin used for CORS and Stripe redirect URLs. */
+const clientUrl = (process.env.CLIENT_URL || "http://localhost:3000")
+  .split(",")[0]
+  .trim()
+  .replace(/\/+$/, "");
+
+const allowedOrigins = new Set(
+  (process.env.CLIENT_URL || "http://localhost:3000")
+    .split(",")
+    .map((origin) => origin.trim().replace(/\/+$/, ""))
+    .filter(Boolean),
+);
 
 app.use(
   cors({
-    origin: allowedOrigins,
+    origin(origin, callback) {
+      // Server-to-server calls and same-origin requests omit the Origin header.
+      if (!origin) return callback(null, true);
+
+      if (allowedOrigins.has(origin.replace(/\/+$/, ""))) {
+        return callback(null, true);
+      }
+
+      // Returning an error here would produce a 500; simply omitting the CORS
+      // headers lets the browser block the request with a clear CORS error.
+      console.warn(`Blocked CORS origin: ${origin}`);
+      return callback(null, false);
+    },
     credentials: true,
   }),
 );
+
+/**
+ * Make sure MongoDB is connected before any route runs. If the connection
+ * failed earlier, this retries it on the next request, so the API recovers on
+ * its own after an outage. If it still can't connect, answer with an
+ * actionable 503 instead of a generic 500.
+ */
+app.use(async (_req, res, next) => {
+  try {
+    await connectToMongoDB();
+    return next();
+  } catch (err) {
+    console.error("MongoDB unavailable:", err?.message ?? err);
+    return res.status(503).send({
+      message:
+        "WedPlan is temporarily unavailable while it reconnects to the database. Please try again in a moment.",
+      code: "DATABASE_UNAVAILABLE",
+    });
+  }
+});
 
 /* --------------------------------------------------------------------------
    Stripe webhook — must be registered before express.json() so the raw body
@@ -233,10 +333,12 @@ app.post(
   "/webhook",
   express.raw({ type: "application/json" }),
   async (req, res) => {
-    const webhookSecret = process.env.STRIPE_SECRET_KEY;
-    if (!webhookSecret) {
-      console.error("STRIPE_SECRET_KEY is not configured.");
-      return res.status(500).send("Webhook is not configured.");
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    if (!stripe || !webhookSecret) {
+      console.error(
+        "Stripe is not fully configured: STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET are required.",
+      );
+      return res.status(503).send("Webhook is not configured.");
     }
 
     let event;
@@ -315,7 +417,9 @@ app.get("/users/:id", requireAuth, async (req, res) => {
     return res.status(400).send({ message: "Invalid user id." });
   }
   if (!isSelfOrAdmin(req, id)) {
-    return res.status(403).send({ message: "You can only view your own profile." });
+    return res
+      .status(403)
+      .send({ message: "You can only view your own profile." });
   }
 
   const user = await users.findOne({ _id: new ObjectId(id) });
@@ -527,8 +631,7 @@ app.get("/services/:id", requireAuth, async (req, res) => {
   const service = await services.findOne({ _id: new ObjectId(id) });
   if (!service) return res.status(404).send({ message: "Service not found." });
 
-  const isOwner =
-    Boolean(req.user) && String(service.vendorId) === req.userId;
+  const isOwner = Boolean(req.user) && String(service.vendorId) === req.userId;
   const isAdmin = req.userRole === "admin";
 
   if (!isPublicServiceDocument(service) && !isOwner && !isAdmin) {
@@ -762,27 +865,23 @@ app.post("/bookings", requireRole("customer"), async (req, res) => {
 });
 
 // Customer: their own active requests. Cancelled requests are hidden.
-app.get(
-  "/bookings/customer/:customerId",
-  requireAuth,
-  async (req, res) => {
-    const { customerId } = req.params;
-    if (!ObjectId.isValid(customerId)) {
-      return res.status(400).send({ message: "Invalid customer id." });
-    }
-    if (!isSelfOrAdmin(req, customerId)) {
-      return res
-        .status(403)
-        .send({ message: "You can only view your own bookings." });
-    }
+app.get("/bookings/customer/:customerId", requireAuth, async (req, res) => {
+  const { customerId } = req.params;
+  if (!ObjectId.isValid(customerId)) {
+    return res.status(400).send({ message: "Invalid customer id." });
+  }
+  if (!isSelfOrAdmin(req, customerId)) {
+    return res
+      .status(403)
+      .send({ message: "You can only view your own bookings." });
+  }
 
-    const result = await bookings
-      .find({ customerId, status: { $ne: "cancelled" } })
-      .sort({ createdAt: -1 })
-      .toArray();
-    res.send(await addDetailsToBookings(result));
-  },
-);
+  const result = await bookings
+    .find({ customerId, status: { $ne: "cancelled" } })
+    .sort({ createdAt: -1 })
+    .toArray();
+  res.send(await addDetailsToBookings(result));
+});
 
 // Vendor: every request addressed to them.
 app.get("/bookings/vendor/:vendorId", requireAuth, async (req, res) => {
@@ -857,43 +956,39 @@ app.patch("/bookings/:id/cancel", requireRole("customer"), async (req, res) => {
 });
 
 // Vendor accepts or rejects a pending request. No re-processing is allowed.
-app.patch(
-  "/bookings/:id/status",
-  requireRole("vendor"),
-  async (req, res) => {
-    const { id } = req.params;
-    const { status } = req.body ?? {};
+app.patch("/bookings/:id/status", requireRole("vendor"), async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body ?? {};
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({ message: "Invalid booking id." });
-    }
-    if (!["accepted", "rejected"].includes(status)) {
-      return res
-        .status(400)
-        .send({ message: "Status must be accepted or rejected." });
-    }
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: "Invalid booking id." });
+  }
+  if (!["accepted", "rejected"].includes(status)) {
+    return res
+      .status(400)
+      .send({ message: "Status must be accepted or rejected." });
+  }
 
-    const booking = await bookings.findOne({ _id: new ObjectId(id) });
-    if (!booking) return res.status(404).send({ message: "Booking not found." });
+  const booking = await bookings.findOne({ _id: new ObjectId(id) });
+  if (!booking) return res.status(404).send({ message: "Booking not found." });
 
-    if (String(booking.vendorId) !== req.userId) {
-      return res
-        .status(403)
-        .send({ message: "This booking does not belong to you." });
-    }
-    if (booking.status !== "pending") {
-      return res
-        .status(400)
-        .send({ message: `Booking is already ${booking.status}.` });
-    }
+  if (String(booking.vendorId) !== req.userId) {
+    return res
+      .status(403)
+      .send({ message: "This booking does not belong to you." });
+  }
+  if (booking.status !== "pending") {
+    return res
+      .status(400)
+      .send({ message: `Booking is already ${booking.status}.` });
+  }
 
-    await bookings.updateOne(
-      { _id: booking._id },
-      { $set: { status, processedAt: new Date() } },
-    );
-    res.send({ message: `Booking ${status}.`, status });
-  },
-);
+  await bookings.updateOne(
+    { _id: booking._id },
+    { $set: { status, processedAt: new Date() } },
+  );
+  res.send({ message: `Booking ${status}.`, status });
+});
 
 /* ---------------------------------------------------------------
    PAYMENT (Stripe) + TRANSACTIONS
@@ -913,6 +1008,13 @@ app.post(
         .send({ message: "You are already a Premium vendor." });
     }
 
+    if (!stripe) {
+      return res.status(503).send({
+        message:
+          "Payments are temporarily unavailable. Please try again in a moment.",
+      });
+    }
+
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer_email: vendor.email,
@@ -927,8 +1029,8 @@ app.post(
         },
       ],
       metadata: { vendorId: req.userId },
-      success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
+      success_url: `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${clientUrl}/payment/cancel`,
     });
 
     res.send({ url: session.url });
@@ -938,49 +1040,51 @@ app.post(
 // Payment success page: return the saved transaction. The webhook is the
 // primary writer; this route reconciles directly with Stripe if it is missing.
 // Only the vendor who owns the checkout session can read it.
-app.get(
-  "/transactions/session/:sessionId",
-  requireAuth,
-  async (req, res) => {
-    const { sessionId } = req.params;
+app.get("/transactions/session/:sessionId", requireAuth, async (req, res) => {
+  const { sessionId } = req.params;
 
-    let result = await transactions.findOne({ stripeSessionId: sessionId });
+  let result = await transactions.findOne({ stripeSessionId: sessionId });
 
-    if (result && !isSelfOrAdmin(req, result.vendorId)) {
-      return res
-        .status(403)
-        .send({ message: "This payment does not belong to you." });
+  if (result && !isSelfOrAdmin(req, result.vendorId)) {
+    return res
+      .status(403)
+      .send({ message: "This payment does not belong to you." });
+  }
+
+  if (!result) {
+    // Reconciliation fallback: verify the session directly with Stripe. This
+    // never trusts the browser redirect — only Stripe's paid status can
+    // create the transaction and activate Premium.
+    if (!stripe) {
+      return res.status(503).send({
+        message:
+          "Payment confirmation is temporarily unavailable. Please refresh in a moment.",
+      });
     }
-
-    if (!result) {
-      // Reconciliation fallback: verify the session directly with Stripe. This
-      // never trusts the browser redirect — only Stripe's paid status can
-      // create the transaction and activate Premium.
-      try {
-        const session = await stripe.checkout.sessions.retrieve(sessionId);
-        if (
-          session.metadata?.vendorId &&
-          session.metadata.vendorId !== req.userId &&
-          req.userRole !== "admin"
-        ) {
-          return res
-            .status(403)
-            .send({ message: "This payment does not belong to you." });
-        }
-        result = await recordPaidCheckoutSession(session);
-      } catch (err) {
-        console.error("Stripe session verification failed:", err.message);
+    try {
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      if (
+        session.metadata?.vendorId &&
+        session.metadata.vendorId !== req.userId &&
+        req.userRole !== "admin"
+      ) {
+        return res
+          .status(403)
+          .send({ message: "This payment does not belong to you." });
       }
+      result = await recordPaidCheckoutSession(session);
+    } catch (err) {
+      console.error("Stripe session verification failed:", err.message);
     }
+  }
 
-    if (!result) {
-      return res
-        .status(404)
-        .send({ message: "Payment is still being confirmed." });
-    }
-    res.send(result);
-  },
-);
+  if (!result) {
+    return res
+      .status(404)
+      .send({ message: "Payment is still being confirmed." });
+  }
+  res.send(result);
+});
 
 // Vendor cancels Premium. One-time purchases have no Stripe subscription to
 // cancel, so the plan is downgraded immediately and the ledger is updated.
@@ -992,7 +1096,7 @@ app.post("/subscription/cancel", requireRole("vendor"), async (req, res) => {
     { sort: { createdAt: -1 } },
   );
 
-  if (transaction?.stripeSubscriptionId) {
+  if (transaction?.stripeSubscriptionId && stripe) {
     await stripe.subscriptions.cancel(transaction.stripeSubscriptionId);
   }
 
@@ -1059,9 +1163,9 @@ app.listen(port, () => {
       "STRIPE_SECRET_KEY is not set. The application will not be able to interact with the Stripe API.",
     );
   }
-  if (!process.env.STRIPE_SECRET_KEY) {
+  if (!process.env.STRIPE_WEBHOOK_SECRET) {
     console.warn(
-      "STRIPE_SECRET_KEY is not set. Stripe webhooks will be rejected.",
+      "STRIPE_WEBHOOK_SECRET is not set. Stripe webhooks will be rejected.",
     );
   }
   if (!process.env.BETTER_AUTH_URL) {
@@ -1071,5 +1175,8 @@ app.listen(port, () => {
   }
   console.log(`Server is running at http://localhost:${port}/`);
 });
+
+
+
 
 export default app;
