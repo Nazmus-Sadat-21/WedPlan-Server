@@ -9,13 +9,7 @@ import { createAuth } from "./auth.js";
 const app = express();
 const port = process.env.PORT || 8000;
 
-/* --------------------------------------------------------------------------
-   Async error safety (Express 4)
-   Express 4 does not forward rejected promises from async handlers to the
-   error middleware, so a DB error would leave the request hanging. This wraps
-   every route handler so rejections reach the error handler. It is harmless on
-   Express 5, which does this natively.
---------------------------------------------------------------------------- */
+
 const wrapHandler = (fn) =>
   typeof fn === "function" && fn.length < 4
     ? (req, res, next) => {
@@ -305,12 +299,7 @@ app.use(
   }),
 );
 
-/**
- * Make sure MongoDB is connected before any route runs. If the connection
- * failed earlier, this retries it on the next request, so the API recovers on
- * its own after an outage. If it still can't connect, answer with an
- * actionable 503 instead of a generic 500.
- */
+
 app.use(async (_req, res, next) => {
   try {
     await connectToMongoDB();
@@ -325,10 +314,9 @@ app.use(async (_req, res, next) => {
   }
 });
 
-/* --------------------------------------------------------------------------
-   Stripe webhook — must be registered before express.json() so the raw body
-   is available for signature verification.
---------------------------------------------------------------------------- */
+
+
+
 app.post(
   "/webhook",
   express.raw({ type: "application/json" }),

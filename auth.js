@@ -1,11 +1,7 @@
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { ObjectId } from "mongodb";
 
-/**
- * Better Auth publishes its public signing keys at /api/auth/jwks. The Express
- * API verifies every access token against that JWKS, so it never trusts a role,
- * user id or blocked flag supplied by the browser.
- */
+
 const AUTH_BASE_URL = (
   process.env.BETTER_AUTH_URL || "http://localhost:3000"
 ).replace(/\/+$/, "");
@@ -14,12 +10,7 @@ const AUDIENCE = process.env.JWT_AUDIENCE || "wedplan-api";
 
 const JWKS = createRemoteJWKSet(new URL(`${AUTH_BASE_URL}/api/auth/jwks`));
 
-/**
- * Build the auth helpers around the users collection. `attachUser` runs on
- * every request and is deliberately non-blocking: public endpoints keep working
- * for anonymous visitors, while protected routes call `requireAuth` /
- * `requireRole` afterwards.
- */
+
 export function createAuth(users) {
   async function attachUser(req, _res, next) {
     const header = req.headers.authorization || "";
